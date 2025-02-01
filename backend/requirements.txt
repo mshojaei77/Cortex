@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-dotenv
+weaviate-client
+langchain
+langchain-community
+langchain-openai
+openai
+pypdf
+pymilvus
