@@ -1,3 +1,6 @@
+assets/external/
+*.db
+.web
 # Python
 __pycache__/
 *.py[cod]
@@ -82,3 +85,5 @@ next-env.d.ts
 backend/data/documents/*
 backend/data/embeddings/*
 volumes/**/*
+*.npy
+*.pdf

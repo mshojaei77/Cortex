@@ -17,8 +17,8 @@ logger.setLevel(logging.INFO)
 @dataclass
 class RAGSettings:
     # Document and cache paths:
-    pdf_dir: str = "backend/data/documents"
-    embedding_cache_dir: str = "backend/data/embeddings"
+    pdf_dir: str = "data/documents"
+    embedding_cache_dir: str = "data/embeddings"
     
     # Text splitting and pre-processing settings:
     chunk_size: int = 1000
