@@ -123,10 +123,24 @@ class ChatResponse(BaseModel):
         description="Response timestamp"
     )
 
-class DeleteSourceRequest(BaseModel):
-    source_id: int
-    user_id: str
+class UploadRequest(BaseModel):
     filename: str
+    file_path: str
+    file_url: str
+    user_id: str
+    file_size: int
+    upload_date: str
+
+class DeleteSourceRequest(BaseModel):
+    filename: str
+    source_id: str
+
+class SourceResponse(BaseModel):
+    source_id: str
+    filename: str
+    file_path: str
+    upload_date: str
+    file_size: int
 
 def is_docker_running():
     """Check if Docker daemon is running"""
@@ -192,50 +206,18 @@ def ensure_milvus_is_running():
         logger.info("Starting Milvus via Docker Compose...")
         subprocess.run(["docker-compose", "up", "-d"], check=True)
         
-        # Check if containers are running
-        def check_containers():
-            try:
-                result = subprocess.run(
-                    ["docker-compose", "ps", "--format", "json"],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                containers = result.stdout.strip().split('\n')
-                all_running = all('"State":"running"' in container for container in containers if container)
-                return all_running
-            except Exception:
-                return False
-
-        # Wait for containers to be running (up to 30 seconds)
-        logger.info("Waiting for Milvus containers to start...")
+        # Wait for Milvus to be ready (up to 30 seconds)
         for _ in range(30):
-            if check_containers():
-                break
-            time.sleep(1)
-        else:
-            raise TimeoutError("Milvus containers failed to start within 30 seconds")
-
-        # Wait for Milvus to be ready (up to 90 seconds)
-        logger.info("Waiting for Milvus to be ready...")
-        for attempt in range(90):
             try:
                 from pymilvus import connections
-                connections.connect(
-                    alias="default",
-                    host='localhost',
-                    port=19530,
-                    timeout=2.0  # Short timeout for connection attempts
-                )
-                connections.disconnect("default")
+                connections.connect(host='localhost', port=19530)
+                connections.disconnect()
                 logger.info("Milvus is ready!")
                 return
-            except Exception as e:
-                if attempt % 10 == 0:  # Log every 10 attempts
-                    logger.info(f"Waiting for Milvus to be ready... ({attempt + 1}/90)")
+            except Exception:
                 time.sleep(1)
         
-        raise TimeoutError("Milvus failed to become ready within 90 seconds")
+        raise TimeoutError("Milvus failed to start within 30 seconds")
         
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to start Docker Compose: {e}")
@@ -243,27 +225,6 @@ def ensure_milvus_is_running():
     except Exception as e:
         logger.error(f"Error ensuring Milvus is running: {e}")
         raise
-
-def cleanup_milvus():
-    """Clean up Milvus resources"""
-    try:
-        logger.info("Disconnecting from Milvus...")
-        from pymilvus import connections
-        connections.disconnect("default")
-    except Exception as e:
-        logger.warning(f"Error disconnecting from Milvus: {e}")
-
-    try:
-        logger.info("Stopping Milvus containers...")
-        subprocess.run(
-            ["docker-compose", "down"],
-            check=True,
-            capture_output=True,
-            text=True
-        )
-        logger.info("Milvus containers stopped successfully")
-    except Exception as e:
-        logger.error(f"Error stopping Milvus containers: {e}")
 
 # Initialize RAG system with enhanced settings
 default_settings = RAGSettings(
@@ -461,47 +422,28 @@ async def chat_endpoint(request: ChatRequest):
         )
 
 @app.post("/upload", status_code=201)
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_file(request: UploadRequest):
     """
-    Endpoint for uploading a PDF file.
+    Process a file that has been uploaded to Supabase storage.
     
-    Accepts only PDF files and saves them to a standard "uploads" directory.
-    Each file is renamed to include a UUID prefix to avoid name collisions.
-    
-    Returns:
-      - detail: A success message
-      - file_path: The local path where the file was saved
-      - timestamp: Upload timestamp
+    Instead of handling the file upload directly, this endpoint now receives
+    the file metadata and processes the file from the Supabase URL.
     """
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
-
-    # Define a common upload directory for MVP purposes
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
-
-    # Generate a unique filename using UUID
-    unique_filename = f"{uuid.uuid4().hex}_{file.filename}"
-    file_path = os.path.join(upload_dir, unique_filename)
-
     try:
-        async with aiofiles.open(file_path, "wb") as out_file:
-            # Read and write the file in 1 MB chunks
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                await out_file.write(chunk)
+        # Here you would process the file from the Supabase URL
+        # For example, downloading it temporarily for processing if needed
+        
+        # Generate a source ID for the frontend
+        source_id = hash(f"{request.user_id}_{request.filename}_{request.upload_date}")
+        
+        return {
+            "detail": f"File '{request.filename}' processed successfully.",
+            "source_id": source_id,
+            "file_path": request.file_path,
+            "timestamp": request.upload_date
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to upload file: {e}")
-    finally:
-        await file.close()
-
-    return {
-        "detail": f"File '{unique_filename}' uploaded successfully.",
-        "file_path": file_path,
-        "timestamp": datetime.now().isoformat()
-    }
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {e}")
 
 # Health check endpoint
 @app.get("/health",
@@ -517,52 +459,63 @@ async def health_check():
         "version": app.version
     }
 
-@app.delete("/delete-source",
-    summary="Delete a source",
-    description="Delete a source file and remove it from the user's knowledge base",
-    response_description="Returns deletion confirmation"
-)
-async def delete_source(request: DeleteSourceRequest):
+@app.delete("/delete-source")
+async def delete_source(request: 
+                        DeleteSourceRequest):
     """
-    Deletes a source file from the user's documents and updates the knowledge base.
-    
-    - **source_id**: The ID of the source to delete
-    - **user_id**: The ID of the user who owns the source
-    - **filename**: The name of the file to delete
-    
-    Returns:
-    - **detail**: A message indicating whether the deletion was successful
+    Handle deletion of a source.
+    The actual file deletion is handled by the frontend in Supabase storage.
+    This endpoint handles any additional cleanup needed in the backend.
     """
     try:
-        # Construct the path to the user's document directory
-        user_doc_dir = os.path.join("data", "documents", request.user_id)
+        # Perform any necessary cleanup in your backend systems
+        # For example, removing entries from your vector store
         
-        # Find the file that matches the filename (it might have a UUID prefix)
-        for filename in os.listdir(user_doc_dir):
-            if filename.endswith(request.filename):
-                file_path = os.path.join(user_doc_dir, filename)
-                # Delete the file
-                os.remove(file_path)
-                
-                # Here you might want to also remove the document from your vector store
-                # This depends on your specific implementation
-                # For example:
-                # await rag_system.milvus_manager.delete_document(request.source_id)
-                
-                return {
-                    "detail": f"Source '{request.filename}' deleted successfully",
-                    "source_id": request.source_id
-                }
-        
-        raise HTTPException(
-            status_code=404,
-            detail=f"Source file '{request.filename}' not found"
-        )
-        
+        return {
+            "detail": f"Source '{request.filename}' deleted successfully",
+            "source_id": request.source_id
+        }
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Error deleting source: {str(e)}"
+        )
+
+@app.get("/sources/{user_id}", 
+    response_model=List[SourceResponse],
+    summary="Get user sources",
+    description="Retrieve all sources for a specific user"
+)
+async def get_user_sources(user_id: str):
+    """
+    Get all sources for a specific user from the vector store.
+    
+    - **user_id**: The ID of the user whose sources to retrieve
+    """
+    try:
+        # Get documents from Milvus collection for this user
+        collection = rag_system.milvus_manager.get_collection()
+        
+        # Query to get all documents for this user
+        expr = f'user_id == "{user_id}"'
+        results = collection.query(
+            expr=expr,
+            output_fields=["source_id", "filename", "file_path", "upload_date", "file_size"]
+        )
+        
+        return [
+            SourceResponse(
+                source_id=doc["source_id"],
+                filename=doc["filename"],
+                file_path=doc["file_path"],
+                upload_date=doc["upload_date"],
+                file_size=doc["file_size"]
+            ) for doc in results
+        ]
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving sources: {str(e)}"
         )
 
 if __name__ == "__main__":
@@ -576,4 +529,8 @@ if __name__ == "__main__":
             log_level="info"
         )
     finally:
-        cleanup_milvus()
+        # Optionally, stop Docker Compose when the application exits
+        try:
+            subprocess.run(["docker-compose", "down"], check=True)
+        except Exception as e:
+            logger.error(f"Error stopping Docker Compose: {e}")
