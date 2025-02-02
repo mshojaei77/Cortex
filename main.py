@@ -9,14 +9,18 @@ from datetime import datetime
 import aiofiles
 import uuid
 import re
+import subprocess
+import time
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Add API metadata
 app = FastAPI(
-    title="Cortex",
-    description="An intelligent research companion powered by RAG technology.",
-    version="2.0.0",
-    docs_url="/docs",   # Swagger UI endpoint
-    redoc_url="/redoc"  # ReDoc endpoint
+    title="Cortex MVP API",
+    description="An MVP API for file uploads and basic document processing.",
+    version="1.0.0"
 )
 
 # Add CORS middleware
@@ -124,6 +128,143 @@ class DeleteSourceRequest(BaseModel):
     user_id: str
     filename: str
 
+def is_docker_running():
+    """Check if Docker daemon is running"""
+    try:
+        subprocess.run(["docker", "info"], 
+                      stdout=subprocess.PIPE, 
+                      stderr=subprocess.PIPE, 
+                      check=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+def start_docker_daemon():
+    """Start Docker daemon with appropriate command based on OS"""
+    try:
+        if os.name == 'nt':  # Windows
+            logger.info("Starting Docker Desktop on Windows...")
+            # Path to Docker Desktop
+            docker_path = r"C:\Program Files\Docker\Docker\Docker Desktop.exe"
+            if not os.path.exists(docker_path):
+                raise FileNotFoundError("Docker Desktop not found in standard location")
+            
+            # Start Docker Desktop
+            subprocess.Popen([docker_path])
+            
+            # Wait for Docker to be ready (up to 60 seconds)
+            for _ in range(60):
+                if is_docker_running():
+                    logger.info("Docker Desktop is ready!")
+                    return
+                time.sleep(1)
+            raise TimeoutError("Docker Desktop failed to start within 60 seconds")
+            
+        else:  # Linux
+            logger.info("Starting Docker daemon on Linux...")
+            subprocess.run(["sudo", "systemctl", "start", "docker"], check=True)
+            
+            # Wait for Docker to be ready
+            for _ in range(30):
+                if is_docker_running():
+                    logger.info("Docker daemon is ready!")
+                    return
+                time.sleep(1)
+            raise TimeoutError("Docker daemon failed to start within 30 seconds")
+            
+    except Exception as e:
+        logger.error(f"Failed to start Docker daemon: {e}")
+        raise
+
+def ensure_milvus_is_running():
+    """Ensure Milvus server is running via Docker Compose"""
+    try:
+        # Check if Docker Compose file exists
+        if not os.path.exists("docker-compose.yml"):
+            raise FileNotFoundError("docker-compose.yml not found in current directory")
+        
+        # Ensure Docker is running
+        if not is_docker_running():
+            logger.info("Docker is not running. Attempting to start Docker...")
+            start_docker_daemon()
+        
+        # Start Docker Compose
+        logger.info("Starting Milvus via Docker Compose...")
+        subprocess.run(["docker-compose", "up", "-d"], check=True)
+        
+        # Check if containers are running
+        def check_containers():
+            try:
+                result = subprocess.run(
+                    ["docker-compose", "ps", "--format", "json"],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                containers = result.stdout.strip().split('\n')
+                all_running = all('"State":"running"' in container for container in containers if container)
+                return all_running
+            except Exception:
+                return False
+
+        # Wait for containers to be running (up to 30 seconds)
+        logger.info("Waiting for Milvus containers to start...")
+        for _ in range(30):
+            if check_containers():
+                break
+            time.sleep(1)
+        else:
+            raise TimeoutError("Milvus containers failed to start within 30 seconds")
+
+        # Wait for Milvus to be ready (up to 90 seconds)
+        logger.info("Waiting for Milvus to be ready...")
+        for attempt in range(90):
+            try:
+                from pymilvus import connections
+                connections.connect(
+                    alias="default",
+                    host='localhost',
+                    port=19530,
+                    timeout=2.0  # Short timeout for connection attempts
+                )
+                connections.disconnect("default")
+                logger.info("Milvus is ready!")
+                return
+            except Exception as e:
+                if attempt % 10 == 0:  # Log every 10 attempts
+                    logger.info(f"Waiting for Milvus to be ready... ({attempt + 1}/90)")
+                time.sleep(1)
+        
+        raise TimeoutError("Milvus failed to become ready within 90 seconds")
+        
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to start Docker Compose: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Error ensuring Milvus is running: {e}")
+        raise
+
+def cleanup_milvus():
+    """Clean up Milvus resources"""
+    try:
+        logger.info("Disconnecting from Milvus...")
+        from pymilvus import connections
+        connections.disconnect("default")
+    except Exception as e:
+        logger.warning(f"Error disconnecting from Milvus: {e}")
+
+    try:
+        logger.info("Stopping Milvus containers...")
+        subprocess.run(
+            ["docker-compose", "down"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        logger.info("Milvus containers stopped successfully")
+    except Exception as e:
+        logger.error(f"Error stopping Milvus containers: {e}")
+
 # Initialize RAG system with enhanced settings
 default_settings = RAGSettings(
     chunk_size=500,
@@ -146,6 +287,9 @@ default_settings = RAGSettings(
     sentence_boundary_detection=True,
     embedding_inference_batch_size=8
 )
+
+# Ensure Milvus is running before initializing RAG system
+ensure_milvus_is_running()
 
 # Initialize RAG system
 rag_system = RAGSystem(settings=default_settings)
@@ -316,100 +460,45 @@ async def chat_endpoint(request: ChatRequest):
             detail=f"Error processing request: {str(e)}"
         )
 
-# New background task function to process the PDF for a specific user.
-def process_user_pdf(file_path: str, user_id: str):
+@app.post("/upload", status_code=201)
+async def upload_pdf(file: UploadFile = File(...)):
     """
-    Background task that triggers PDF processing for the user.
-    Note: In a production system you might want to trigger a more sophisticated pipeline.
-    """
-    from rag_system import RAGSettings, RAGSystem
-    import os
-
-    # Create a user-specific settings instance where pdf_dir is unique for the user
-    user_pdf_dir = os.path.join("data", "documents", user_id)
-    # You could also update additional settings to isolate the Milvus collection or add a user_id field.
-    user_settings = RAGSettings(pdf_dir=user_pdf_dir)
-    # Instantiate RAG system for the user
-    user_rag_system = RAGSystem(settings=user_settings)
-    # Retrieve any already processed document sources.
-    existing_docs = user_rag_system.milvus_manager.get_existing_docs() or set()
-    # Process and cache this pdf file.
-    user_rag_system.doc_processor.process_pdfs(existing_docs=existing_docs)
-    # After processing, you might want to insert new documents into Milvus.
-    if user_rag_system.doc_processor.new_documents:
-        if user_rag_system.doc_processor.new_vectors:
-            embedding_dim = len(user_rag_system.doc_processor.new_vectors[0])
-        else:
-            embedding_dim = 768  # fallback default dimension if needed
-        schema = user_rag_system.milvus_manager.create_collection_schema(embedding_dim)
-        collection = user_rag_system.milvus_manager.create_or_use_collection(schema)
-        user_rag_system.milvus_manager.insert_documents(
-            collection,
-            user_rag_system.doc_processor.new_documents,
-            user_rag_system.doc_processor.new_vectors,
-            user_rag_system.doc_processor.new_texts
-        )
-        user_rag_system.milvus_manager.load_collection(collection)
-
-@app.post("/upload", 
-    summary="Upload PDF document",
-    description="Upload a PDF file for processing into the user's knowledge base",
-    response_description="Returns upload confirmation"
-)
-async def upload_pdf(
-    background_tasks: BackgroundTasks, 
-    file: UploadFile = File(...),
-    user_id: str = Form(...)):   # New required form field for the user's ID
-    """
-    Uploads a PDF file which is saved in a user-specific folder
-    (data/documents/<user_id>).
-
-    - **file**: PDF file to be uploaded.
-    - **user_id**: Identifier for the user uploading the file.
-
+    Endpoint for uploading a PDF file.
+    
+    Accepts only PDF files and saves them to a standard "uploads" directory.
+    Each file is renamed to include a UUID prefix to avoid name collisions.
+    
     Returns:
-    - **detail**: A message indicating whether the upload was successful.
-    - **file_path**: The local path where the file was stored.
-    - **timestamp**: Upload timestamp.
+      - detail: A success message
+      - file_path: The local path where the file was saved
+      - timestamp: Upload timestamp
     """
-    # Validate file content type and name
     if file.content_type != "application/pdf":
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid file type. Only PDF files are allowed."
-        )
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
 
-    # Create user-specific directory. This ensures each user has its own knowledge base.
-    upload_dir = os.path.join("data", "documents", user_id)
+    # Define a common upload directory for MVP purposes
+    upload_dir = "uploads"
     os.makedirs(upload_dir, exist_ok=True)
-    
-    # Sanitize and generate a unique file name using UUID to prevent collisions.
-    original_filename = file.filename
-    safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '', original_filename)
-    unique_filename = f"{uuid.uuid4().hex}_{safe_filename}"
+
+    # Generate a unique filename using UUID
+    unique_filename = f"{uuid.uuid4().hex}_{file.filename}"
     file_path = os.path.join(upload_dir, unique_filename)
-    
-    # Save the file in chunks asynchronously to prevent high memory usage.
+
     try:
         async with aiofiles.open(file_path, "wb") as out_file:
+            # Read and write the file in 1 MB chunks
             while True:
-                chunk = await file.read(1024 * 1024)  # 1 MB per chunk
+                chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
                 await out_file.write(chunk)
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to upload file: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to upload file: {e}")
     finally:
         await file.close()
-    
-    # Schedule background processing of the file specific to this user.
-    background_tasks.add_task(process_user_pdf, file_path, user_id)
-    
+
     return {
-        "detail": f"File '{unique_filename}' uploaded successfully for user {user_id}",
+        "detail": f"File '{unique_filename}' uploaded successfully.",
         "file_path": file_path,
         "timestamp": datetime.now().isoformat()
     }
@@ -477,10 +566,14 @@ async def delete_source(request: DeleteSourceRequest):
         )
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
-    )
+    try:
+        ensure_milvus_is_running()
+        uvicorn.run(
+            "main:app",
+            host="0.0.0.0",
+            port=8000,
+            reload=True,
+            log_level="info"
+        )
+    finally:
+        cleanup_milvus()
