@@ -1,4 +1,4 @@
-Below is a step‐by‐step guide outlining how you can complete the entire website’s logic. This guide covers backend architecture with Python and FastAPI, vector search with Milvus, integration with language models via OpenAI and LangChain, storage and authentication using Supabase, and how the frontend interacts with all these components. Each step explains the design decisions and the best practices so you can build a high-quality, production-ready solution.
+This guide covers backend architecture with Python and FastAPI, vector search with Milvus, integration with language models via OpenAI and LangChain, storage and authentication using Supabase, and how the frontend interacts with all these components. Each step explains the design decisions and the best practices so you can build a high-quality, production-ready solution.
 
 ---
 
